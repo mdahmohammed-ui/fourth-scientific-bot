@@ -577,6 +577,7 @@ async def main_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def admin_menu_markup() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("إضافة ملف", callback_data="adm:add")],
+        [InlineKeyboardButton("إضافة ملف بواسطة ID", callback_data="adm:addbyid")],
         [InlineKeyboardButton("حذف ملف", callback_data="adm:delete"),
          InlineKeyboardButton("تعديل ملف", callback_data="adm:edit")],
         [InlineKeyboardButton("استبدال ملف", callback_data="adm:replace"),
@@ -762,6 +763,29 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
         ]
         await query.edit_message_text("اختَر نوع الملف:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "adm:addbyid":
+        set_admin_state(context, action="add_file_id_choose_kind")
+        keyboard = [
+            [InlineKeyboardButton("📘 كتاب", callback_data="addidkind:book")],
+            [InlineKeyboardButton("📙 ملزمة", callback_data="addidkind:note")],
+            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
+        ]
+        await query.edit_message_text("اختَر نوع الملف الذي تريد إضافته باستخدام File ID:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("addidkind:"):
+        kind = data.split(":", 1)[1]
+        set_admin_state(context, action="add_file_id_choose_subject", kind=kind)
+        markup = await admin_subject_picker("addidsub")
+        await query.edit_message_text("اختَر المادة:", reply_markup=markup)
+        return
+
+    if data.startswith("addidsub:"):
+        subject_id = int(data.split(":", 1)[1])
+        set_admin_state(context, action="add_file_wait_file_id", subject_id=subject_id)
+        await query.edit_message_text("أرسل الـ File ID كنص، ثم سأطلب اسم الملف.\n\nللإلغاء: /cancel")
         return
 
     if data.startswith("addkind:"):
@@ -1094,6 +1118,25 @@ async def admin_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         admin_state_reset(context)
         await message.reply_text("تم إنهاء عملية التعرف على ID.", reply_markup=admin_menu_markup())
+        return
+
+    # ADD FILE BY EXISTING TELEGRAM FILE ID
+    if action == "add_file_wait_file_id":
+        if not message.text or not message.text.strip():
+            await message.reply_text("أرسل الـ File ID كنص فقط.\n\nللإلغاء: /cancel")
+            return
+        file_id = message.text.strip()
+        if any(ch.isspace() for ch in file_id):
+            await message.reply_text("الـ File ID غير صحيح لأنه يحتوي على مسافات. أرسله كما ظهر لك تماماً.")
+            return
+        existing = await db_execute("SELECT id FROM files WHERE file_id=?", (file_id,), fetch="one")
+        if existing:
+            await message.reply_text("هذا الـ File ID موجود مسبقاً في قاعدة البيانات. أرسل ID مختلفاً أو ألغِ العملية بـ /cancel.")
+            return
+        state["file_id_new"] = file_id
+        state["file_type"] = "document"
+        state["action"] = "add_file_wait_title"
+        await message.reply_text("تم استلام الـ ID. هسه أرسل اسم الملزمة أو الكتاب.")
         return
 
     # ADD FILE: wait for document
