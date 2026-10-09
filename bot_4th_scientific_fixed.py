@@ -27,7 +27,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "PUT_YOUR_BOT_TOKEN_HERE").strip()
 OWNER_ID = 7683201905
 MANDATORY_CHANNEL = "@Kii_8i"
 DB_FILE = "fourth_scientific_bot.db"
@@ -743,6 +743,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:close":
         admin_state_reset(context)
         await query.edit_message_text("تم إغلاق لوحة المالك.")
+        return
+
+    # File ID lookup: enter a state that accepts the next uploaded file.
+    if data == "adm:fileid":
+        set_admin_state(context, action="fileid_wait_file")
+        await query.edit_message_text(
+            "أرسل ملف PDF الآن كـ Document حتى أستخرج الـ File ID.\n\n"
+            "للإلغاء: /cancel"
+        )
         return
 
     if data == "adm:add":
