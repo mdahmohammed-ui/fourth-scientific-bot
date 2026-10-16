@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 # Security: set BOT_TOKEN in your hosting environment; do not hard-code it.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN").strip()
 OWNER_ID = 7683201905
 DEFAULT_CHANNEL = "@Kii_8i"
 DB_FILE = os.getenv("DB_FILE", "fourth_scientific_bot.db")
