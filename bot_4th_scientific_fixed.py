@@ -1,17 +1,19 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime
 
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    InlineQueryResultCachedDocument,
     KeyboardButton,
+    ReplyKeyboardMarkup,
+    SwitchInlineQueryChosenChat,
+    Update,
 )
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
@@ -19,1388 +21,953 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "PUT_YOUR_BOT_TOKEN_HERE").strip()
+# Security: set BOT_TOKEN in your hosting environment; do not hard-code it.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = 7683201905
-MANDATORY_CHANNEL = "@Kii_8i"
-DB_FILE = "fourth_scientific_bot.db"
+DEFAULT_CHANNEL = "@Kii_8i"
+DB_FILE = os.getenv("DB_FILE", "fourth_scientific_bot.db")
+SUB_CACHE_SECONDS = 300
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("fourth_scientific_bot")
-
-# ============================================================
-# FIXED DATA SUPPLIED BY USER
-# No extra subjects/files are added here.
-# The old Math book is intentionally NOT seeded because the user
-# said it is not the final Math book.
-# ============================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("bot")
 
 SUBJECTS = [
-    ("رياضيات", "📐", 1),
-    ("كيمياء", "🧪", 2),
-    ("فيزياء", "⚡", 3),
-    ("أحياء", "🧬", 4),
-    ("English", "🇬🇧", 5),
-    ("التربية الإسلامية", "📖", 6),
-    ("الحاسوب", "💻", 7),
-    ("اللغة العربية", "📚", 9),
-    ("جرائم حزب البعث", "⚖️", 10),
+    ("رياضيات", "📐", "primary", "ch"),
+    ("كيمياء", "🧪", "primary", "ch"),
+    ("فيزياء", "⚡", "primary", "ch"),
+    ("أحياء", "🧬", "success", "ch"),
+    ("الحاسوب", "💻", "success", "ch"),
+    ("English", "🇬🇧", "danger", "unit"),
+    ("اللغة العربية", "📚", "success", "unit"),
+    ("التربية الإسلامية", "📖", "danger", "unit"),
+    ("جرائم حزب البعث", "⚖️", "danger", "ch"),
 ]
 
-BOOKS = []
-NOTES = []
+HOME_TEXT = "هلا بيك ببوت الرابع العلمي 🎓\nاختر من الأزرار بالأسفل:"
+GATE_TEXT = "حتى تستخدم البوت، اشترك بالقناة أولاً، ثم اضغط التحقق من الاشتراك."
+BACK_TXT = "🔙 رجوع"
+CANCEL_TXT = "❌ إلغاء"
 
+CH_LABELS = {"ch1": "الفصل الأول", "ch2": "الفصل الثاني", "ch3": "الفصل الثالث"}
+UNIT_LABELS = {"u1": "الوحدة الأولى", "u2": "الوحدة الثانية", "u3": "الوحدة الثالثة"}
+SECTION_NAMES = {**CH_LABELS, **UNIT_LABELS}
+Q_SECTIONS = {"ch1": "الفصل الأول", "half": "نصف السنة", "ch2": "الفصل الثاني"}
+Q_MONTHS = {"m1": "الشهر الأول", "m2": "الشهر الثاني"}
 
-# Unknown files that were supplied but whose subject/role was not safely
-# inferable are intentionally NOT inserted into the database.
-# Summaries were not supplied, so none are seeded.
+ADMIN_ACTIONS = {
+    "➕ إضافة ملف": "addfile",
+    "🆔 إضافة ملف بـ ID": "addid",
+    "➕ إضافة اسئلة": "addquestion",
+    "➕ إضافة ملخصات": "addsummary",
+    "✏️ تعديل ملف": "editfile",
+    "🔁 استبدال ملف": "replacefile",
+    "🗑 حذف ملف": "deletefile",
+    "👁 إخفاء/إظهار ملف": "togglefile",
+    "➕ إضافة مادة": "addsubject",
+    "✏️ تعديل مادة": "editsubject",
+    "🗑 حذف مادة": "deletesubject",
+    "🔎 التعرف على ID": "identify",
+    "🔗 إنشاء رابط": "genlink",
+    "📢 إعلان": "broadcast",
+    "📣 تغيير القناة": "channel",
+}
 
-DEFAULT_WELCOME = (
-    "هلا بيك ببوت الرابع العلمي.\n"
-    "اختَر المادة من القائمة بالأسفل."
-)
+FIRST_STEP = {
+    "addfile": "subject", "addid": "subject", "addsummary": "subject",
+    "addquestion": "qsection", "addsubject": "sname", "editsubject": "subject",
+    "deletesubject": "subject", "editfile": "file", "replacefile": "file",
+    "deletefile": "file", "togglefile": "file", "identify": "wait",
+    "genlink": "fid", "broadcast": "text", "channel": "text",
+}
 
-# ============================================================
-# DATABASE
-# ============================================================
+FIELD_COL = {
+    "editsubject": {"✏️ تعديل الاسم": "name", "😀 تعديل الإيموجي": "emoji"},
+    "editfile": {"✏️ تعديل الاسم": "title", "👨‍🏫 تعديل الأستاذ": "teacher"},
+}
 
+# One SQLite connection is retained for compatibility with the existing DB.
+DB = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+DB.row_factory = sqlite3.Row
+DB.execute("PRAGMA foreign_keys=ON")
+DB.execute("PRAGMA busy_timeout=30000")
 DB_LOCK = asyncio.Lock()
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def q(sql, p=()):
+    return DB.execute(sql, p).fetchall()
 
 
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def q1(sql, p=()):
+    return DB.execute(sql, p).fetchone()
 
 
-def init_db() -> None:
-    conn = db_connect()
+def x(sql, p=()):
+    cur = DB.execute(sql, p)
+    DB.commit()
+    return cur
+
+
+def init_db():
+    DB.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY, joined TEXT, blocked INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, emoji TEXT NOT NULL,
+        color TEXT NOT NULL DEFAULT 'success', stype TEXT NOT NULL DEFAULT 'ch',
+        pos INTEGER NOT NULL DEFAULT 0, visible INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_id INTEGER REFERENCES subjects(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, section TEXT, month TEXT,
+        title TEXT NOT NULL, teacher TEXT,
+        file_id TEXT UNIQUE NOT NULL, visible INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+    """)
+    if not q1("SELECT 1 FROM settings WHERE key='seeded'"):
+        for i, (name, emoji, color, stype) in enumerate(SUBJECTS, 1):
+            x("INSERT OR IGNORE INTO subjects(name, emoji, color, stype, pos) VALUES(?,?,?,?,?)",
+              (name, emoji, color, stype, i))
+        x("INSERT INTO settings(key, value) VALUES('seeded', '1')")
+    x("INSERT OR IGNORE INTO settings(key, value) VALUES('channel', ?)", (DEFAULT_CHANNEL,))
+    x("INSERT OR IGNORE INTO settings(key, value) VALUES('sub_on', '1')")
+
+
+def setting(key):
+    r = q1("SELECT value FROM settings WHERE key=?", (key,))
+    return r["value"] if r else ""
+
+
+def upsert_user(uid):
+    x("INSERT OR IGNORE INTO users(user_id, joined) VALUES(?, ?)",
+      (uid, datetime.now().isoformat(timespec="seconds")))
+
+
+def label(s):
+    return f"{s['emoji']} {s['name']}"
+
+
+def subject_by_label(text, visible_only=False):
+    sql = "SELECT * FROM subjects" + (" WHERE visible=1" if visible_only else "") + " ORDER BY pos"
+    for s in q(sql):
+        if label(s) == text:
+            return s
+    return None
+
+
+def insert_file(sid, kind, section, month, title, teacher, file_id):
     try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                joined_at TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                blocked INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS subjects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                emoji TEXT NOT NULL DEFAULT '',
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                visible INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject_id INTEGER NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('book', 'note')),
-                title TEXT NOT NULL,
-                teacher TEXT,
-                file_id TEXT NOT NULL UNIQUE,
-                file_type TEXT NOT NULL DEFAULT 'document',
-                visible INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('welcome', ?)",
-            (DEFAULT_WELCOME,),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('subscription_enabled', '1')"
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('mandatory_channel', ?)",
-            (MANDATORY_CHANNEL,),
-        )
-
-        for name, emoji, order in SUBJECTS:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO subjects(name, emoji, sort_order, visible)
-                VALUES(?, ?, ?, 1)
-                """,
-                (name, emoji, order),
-            )
-
-        # User requested removing Kurdish entirely. Delete both spelling variants
-        # from the database; ON DELETE CASCADE removes their associated files.
-        conn.execute("DELETE FROM subjects WHERE TRIM(name) IN ('الكردي', 'كردي')")
-
-        conn.commit()
-    finally:
-        conn.close()
+        x("INSERT INTO files(subject_id, kind, section, month, title, teacher, file_id) VALUES(?,?,?,?,?,?,?)",
+          (sid, kind, section, month, title, teacher, file_id))
+        return True, None
+    except sqlite3.IntegrityError:
+        return False, "هذا الـ File ID موجود مسبقاً."
 
 
-async def db_execute(sql: str, params=(), fetch: str = "none"):
-    async with DB_LOCK:
-        conn = db_connect()
-        try:
-            cur = conn.execute(sql, params)
-            result = None
-            if fetch == "one":
-                result = cur.fetchone()
-            elif fetch == "all":
-                result = cur.fetchall()
-            elif fetch == "value":
-                row = cur.fetchone()
-                result = row[0] if row else None
-            conn.commit()
-            return result
-        finally:
-            conn.close()
-
-
-async def db_script(sql: str) -> None:
-    async with DB_LOCK:
-        conn = db_connect()
-        try:
-            conn.executescript(sql)
-            conn.commit()
-        finally:
-            conn.close()
-
-
-async def upsert_user(user) -> None:
-    await db_execute(
-        """
-        INSERT INTO users(user_id, username, first_name, joined_at, last_seen, blocked)
-        VALUES(?, ?, ?, ?, ?, 0)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_seen=excluded.last_seen,
-            blocked=0
-        """,
-        (user.id, user.username, user.first_name, now_iso(), now_iso()),
-    )
-
-
-async def get_setting(key: str, default: str = "") -> str:
-    value = await db_execute(
-        "SELECT value FROM settings WHERE key = ?",
-        (key,),
-        fetch="value",
-    )
-    return default if value is None else value
-
-
-async def set_setting(key: str, value: str) -> None:
-    await db_execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
-
-async def subscription_enabled() -> bool:
-    return (await get_setting("subscription_enabled", "1")) == "1"
-
-
-async def is_subscribed(bot, user_id: int) -> bool:
-    if is_owner(user_id):
-        return True
-    if not await subscription_enabled():
-        return True
-
-    channel = await get_setting("mandatory_channel", MANDATORY_CHANNEL)
+def kbtn(text, style=None):
+    # Telegram clients may ignore button styles; unsupported styles must not break bot setup.
     try:
-        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-        if member.status in {
-            "member",
-            "administrator",
-            "creator",
-        }:
-            return True
-        if member.status == "restricted":
-            return bool(getattr(member, "is_member", False))
-        return False
-    except TelegramError:
-        # If the bot cannot inspect the channel, do not falsely grant access.
-        return False
+        return KeyboardButton(text, style=style) if style else KeyboardButton(text)
+    except (TypeError, ValueError):
+        return KeyboardButton(text)
 
 
-async def ensure_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if user is None:
-        return False
-    if is_owner(user.id):
+def rkb(rows):
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+BACK = kbtn(BACK_TXT, "danger")
+CANCEL = kbtn(CANCEL_TXT, "danger")
+
+
+def home_markup(owner):
+    rows, row = [], []
+    for s in q("SELECT * FROM subjects WHERE visible=1 ORDER BY pos"):
+        row.append(kbtn(label(s), s["color"]))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([kbtn("❓ الاسئلة", "primary")])
+    if owner:
+        rows.append([kbtn("🛠 لوحة المالك", "primary")])
+    return rkb(rows)
+
+
+def subject_markup():
+    return rkb([
+        [kbtn("📘 الكتب", "success"), kbtn("📙 الملازم", "success")],
+        [kbtn("🧾 الملخصات", "success")],
+        [BACK],
+    ])
+
+
+def owner_markup():
+    return rkb([
+        [kbtn("➕ إضافة ملف", "success"), kbtn("🆔 إضافة ملف بـ ID", "success")],
+        [kbtn("➕ إضافة اسئلة", "success"), kbtn("➕ إضافة ملخصات", "success")],
+        [kbtn("✏️ تعديل ملف", "success"), kbtn("🔁 استبدال ملف", "success")],
+        [kbtn("🗑 حذف ملف", "danger"), kbtn("👁 إخفاء/إظهار ملف", "primary")],
+        [kbtn("➕ إضافة مادة", "success"), kbtn("✏️ تعديل مادة", "success")],
+        [kbtn("🗑 حذف مادة", "danger")],
+        [kbtn("🆔 جميع الـ IDs", "primary"), kbtn("🔎 التعرف على ID", "primary")],
+        [kbtn("🔗 إنشاء رابط", "success")],
+        [kbtn("📊 الإحصائيات", "primary"), kbtn("📢 إعلان", "primary")],
+        [kbtn("⚙️ تشغيل/إيقاف الاشتراك", "primary"), kbtn("📣 تغيير القناة", "primary")],
+        [kbtn("🏠 القائمة الرئيسية", "danger")],
+    ])
+
+
+def channel_username():
+    raw = setting("channel").strip()
+    if raw.startswith("@"):
+        return raw[1:]
+    match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", raw)
+    return match.group(1) if match else raw.lstrip("@")
+
+
+def gate_markup(pending=None):
+    ch = channel_username()
+    rows = []
+    if ch:
+        rows.append([InlineKeyboardButton("📢 اشترك بالقناة", url=f"https://t.me/{ch}", style="primary")])
+    rows.append([InlineKeyboardButton("✅ التحقق من الاشتراك", callback_data=f"chk:{pending or 0}", style="primary")])
+    return InlineKeyboardMarkup(rows)
+
+
+def share_markup(row_id):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📤 مشاركة الملف",
+        switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+            query=str(row_id), allow_user_chats=True, allow_group_chats=True, allow_channel_chats=True),
+        style="success",
+    )]])
+
+
+def file_rows(ctx, rows, icon):
+    choices, out = {}, []
+    for r in rows:
+        base = f"{icon} {r['title']}"[:60]
+        text, n = base, 2
+        while text in choices:
+            text = f"{base} ({n})"
+            n += 1
+        choices[text] = r["id"]
+        out.append([kbtn(text, "success")])
+    ctx.user_data["choices"] = choices
+    return out
+
+
+def subj_rows():
+    btns = [kbtn(label(s)) for s in q("SELECT * FROM subjects ORDER BY pos")]
+    return [btns[i:i + 2] for i in range(0, len(btns), 2)]
+
+
+def owner_file_rows():
+    rows = q("SELECT * FROM files ORDER BY id")
+    return [[kbtn(f"#{r['id']} {r['title']}"[:60])] for r in rows]
+
+
+def build_screen(ctx, screen, owner):
+    kind = screen[0]
+    if kind == "home":
+        return HOME_TEXT, home_markup(owner)
+    if kind == "subject":
+        s = q1("SELECT * FROM subjects WHERE id=?", (screen[1],))
+        if not s:
+            return HOME_TEXT, home_markup(owner)
+        return f"{label(s)}\nاختر:", subject_markup()
+    if kind == "list":
+        sid, ftype = screen[1], screen[2]
+        icon = "📘" if ftype == "book" else "📙"
+        title = "📘 الكتب" if ftype == "book" else "📙 الملازم"
+        rows = q("SELECT * FROM files WHERE subject_id=? AND kind=? AND visible=1 ORDER BY id", (sid, ftype))
+        if not rows:
+            ctx.user_data["choices"] = {}
+            return f"{title}\nلا توجد ملفات حالياً.", rkb([[BACK]])
+        return title, rkb(file_rows(ctx, rows, icon) + [[BACK]])
+    if kind == "summaries":
+        s = q1("SELECT * FROM subjects WHERE id=?", (screen[1],))
+        if not s:
+            return HOME_TEXT, home_markup(owner)
+        labels = CH_LABELS if s["stype"] == "ch" else UNIT_LABELS
+        ctx.user_data["choices"] = {}
+        return f"🧾 الملخصات — {s['name']}\nاختر:", rkb([[kbtn(v, "success") for v in labels.values()], [BACK]])
+    if kind == "questions":
+        ctx.user_data["choices"] = {}
+        return "❓ الاسئلة\nاختر:", rkb([
+            [kbtn("الفصل الأول", "success"), kbtn("نصف السنة", "success"), kbtn("الفصل الثاني", "success")],
+            [BACK],
+        ])
+    if kind == "qchapter":
+        ctx.user_data["choices"] = {}
+        return f"❓ {Q_SECTIONS.get(screen[1], 'الأسئلة')}\nاختر الشهر:", rkb([
+            [kbtn(Q_MONTHS["m1"], "success"), kbtn(Q_MONTHS["m2"], "success")],
+            [BACK],
+        ])
+    return HOME_TEXT, home_markup(owner)
+
+
+def parent(screen):
+    k = screen[0]
+    if k in ("list", "summaries"):
+        return ("subject", screen[1])
+    if k == "subject":
+        return ("home",)
+    if k == "qchapter":
+        return ("questions",)
+    return ("home",)
+
+
+async def show(msg, ctx, screen, owner):
+    text, markup = build_screen(ctx, screen, owner)
+    ctx.user_data["screen"] = screen
+    await msg.reply_text(text, reply_markup=markup)
+
+
+async def show_admin(msg, ctx):
+    ctx.user_data.pop("flow", None)
+    ctx.user_data["screen"] = ("admin",)
+    await msg.reply_text("🛠 لوحة المالك", reply_markup=owner_markup())
+
+
+async def finish(msg, ctx, text):
+    ctx.user_data.pop("flow", None)
+    await msg.reply_text(text, reply_markup=owner_markup())
+
+
+SUB_CACHE = {}
+
+
+async def is_sub(bot, uid):
+    if uid == OWNER_ID or setting("sub_on") != "1":
         return True
-
-    # Cache successful membership checks for five minutes so each navigation
-    # button does not wait on a fresh Telegram network request.
-    now = time.monotonic()
-    cached = context.user_data.get("subscription_cache")
-    if cached and cached.get("ok") and now - cached.get("checked_at", 0) < 300:
+    now = time.time()
+    if SUB_CACHE.get(uid, 0) > now:
         return True
-
-    await upsert_user(user)
-    ok = await is_subscribed(context.bot, user.id)
-    context.user_data["subscription_cache"] = {"ok": ok, "checked_at": now}
+    try:
+        member = await bot.get_chat_member(setting("channel"), uid)
+    except TelegramError as e:
+        log.warning("subscription check failed for channel %s: %s", setting("channel"), e)
+        return False
+    ok = member.status in ("member", "administrator", "creator", "restricted") and getattr(member, "is_member", True)
+    if ok:
+        SUB_CACHE[uid] = now + SUB_CACHE_SECONDS
+    else:
+        SUB_CACHE.pop(uid, None)
     return ok
 
-async def send_subscription_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    channel = await get_setting("mandatory_channel", MANDATORY_CHANNEL)
-    public_link = channel
-    if channel.startswith("@"):
-        public_link = "https://t.me/" + channel[1:]
 
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("تحقق من الاشتراك")]],
-        resize_keyboard=True,
-        is_persistent=True,
-        one_time_keyboard=False,
-    )
-    await update.effective_message.reply_text(
-        f"حتى تستخدم البوت، اشترك بالقناة أولاً.\n{public_link}\n\nبعد الاشتراك اضغط: تحقق من الاشتراك",
-        reply_markup=keyboard,
-    )
-
-
-async def get_visible_subjects():
-    return await db_execute(
-        "SELECT * FROM subjects WHERE visible=1 ORDER BY sort_order, id",
-        fetch="all",
-    )
-
-
-async def get_subject(subject_id: int):
-    return await db_execute(
-        "SELECT * FROM subjects WHERE id=?",
-        (subject_id,),
-        fetch="one",
-    )
-
-
-async def get_file(file_id: int):
-    return await db_execute(
-        """
-        SELECT f.*, s.name AS subject_name, s.emoji AS subject_emoji
-        FROM files f JOIN subjects s ON s.id=f.subject_id
-        WHERE f.id=?
-        """,
-        (file_id,),
-        fetch="one",
-    )
-
-
-async def get_files(subject_id: int, kind: str, visible_only: bool = True):
-    extra = "AND visible=1" if visible_only else ""
-    return await db_execute(
-        f"SELECT * FROM files WHERE subject_id=? AND kind=? {extra} ORDER BY id",
-        (subject_id, kind),
-        fetch="all",
-    )
-
-
-def kind_label(kind: str) -> str:
-    return {"book": "كتاب", "note": "ملزمة"}[kind]
-
-
-def file_button_title(row) -> str:
-    teacher = f" — {row['teacher']}" if row["teacher"] else ""
-    return f"{row['title']}{teacher}"
-
-
-def note_caption(row) -> str:
-    teacher = row["teacher"] or ""
-    title = row["title"] or "ملزمة"
-    return (
-        f"📙: {title}\n"
-        f"👨‍🏫: {teacher}\n"
-        "🏷: للصف الرابع الاعدادي\n"
-        "📆: تاريخ الإصدار 2026"
-    )
-
-
-async def main_menu_markup() -> ReplyKeyboardMarkup:
-    subjects = await get_visible_subjects()
-
-    preferred_order = [
-        "اللغة العربية",
-        "التربية الإسلامية",
-        "English",
-        "رياضيات",
-        "كيمياء",
-        "فيزياء",
-        "أحياء",
-        "الحاسوب",
-        "جرائم حزب البعث",
-    ]
-
-    # Deduplicate by normalized name so a duplicate such as "كردي"
-    # cannot create a second button.
-    by_name = {}
-    for subject in subjects:
-        name = subject["name"].strip()
-        normalized = " ".join(name.split()).casefold()
-        by_name.setdefault(normalized, subject)
-
-    ordered = []
-    used = set()
-    for name in preferred_order:
-        normalized = name.casefold()
-        if normalized in by_name and normalized not in used:
-            ordered.append(by_name[normalized])
-            used.add(normalized)
-    ordered.extend(s for normalized, s in by_name.items() if normalized not in used)
-
-    keyboard = []
-    current = []
-    for subject in ordered:
-        current.append(KeyboardButton(f"{subject['emoji']} {subject['name']}"))
-        if len(current) == 2:
-            keyboard.append(current)
-            current = []
-    if current:
-        keyboard.append(current)
-
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        is_persistent=True,
-        one_time_keyboard=False,
-    )
-
-
-def reply_keyboard(rows):
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(str(item)) for item in row] for row in rows],
-        resize_keyboard=True,
-        is_persistent=True,
-        one_time_keyboard=False,
-    )
-
-
-async def replace_user_menu(message, context, text, markup):
-    # Keep previous messages visible; do not spend a network request deleting them.
-    return await message.reply_text(text, reply_markup=markup)
-
-async def show_main_menu(target_message, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    welcome = await get_setting("welcome", DEFAULT_WELCOME)
-    sent = await replace_user_menu(target_message, context, welcome, await main_menu_markup())
-    context.user_data["user_nav"] = {"level": "main", "menu_message_id": sent.message_id}
-    return sent
-
-
-async def show_subject_reply_menu(message, context, subject_id: int):
-    subject = await get_subject(subject_id)
-    if not subject or not subject["visible"]:
-        await message.reply_text("القسم غير متاح حالياً.", reply_markup=await main_menu_markup())
+async def send_item(ctx, chat_id, row_id, owner):
+    row = q1("SELECT * FROM files WHERE id=?", (row_id,))
+    if not row or (not row["visible"] and not owner):
+        await ctx.bot.send_message(chat_id, "الملف غير متاح حالياً.")
         return
-
-    markup = reply_keyboard([["📘 الكتب", "📙 الملازم"], ["رجوع"]])
-    sent = await replace_user_menu(message, context, f"{subject['emoji']} {subject['name']}\nاختَر:", markup)
-    context.user_data["user_nav"] = {
-        "level": "subject",
-        "subject_id": subject_id,
-        "menu_message_id": sent.message_id,
-    }
-
-
-async def show_file_reply_menu(message, context, subject_id: int, kind: str):
-    subject = await get_subject(subject_id)
-    if not subject or not subject["visible"]:
-        await show_main_menu(message, context)
-        return
-
-    files = await get_files(subject_id, kind, True)
-    file_buttons = {}
-    rows = []
-    current = []
-
-    for f in files:
-        label = ("📘 " if kind == "book" else "📙 ") + file_button_title(f)
-        file_buttons[label] = f["id"]
-        current.append(label)
-        if len(current) == 1:
-            rows.append(current)
-            current = []
-    if current:
-        rows.append(current)
-
-    rows.append(["رجوع"])
-    context.user_data["user_nav"] = {
-        "level": "files",
-        "subject_id": subject_id,
-        "kind": kind,
-        "file_buttons": file_buttons,
-    }
-
-    title = "📘 الكتب" if kind == "book" else "📙 الملازم"
-    if not files:
-        sent = await replace_user_menu(
-            message, context,
-            f"{title} — {subject['name']}\nلا توجد ملفات مضافة حالياً.",
-            reply_keyboard([["رجوع"]]),
-        )
-        context.user_data["user_nav"]["menu_message_id"] = sent.message_id
-        return
-
-    sent = await replace_user_menu(
-        message, context,
-        f"{title} — {subject['name']}",
-        reply_keyboard(rows),
-    )
-    context.user_data["user_nav"]["menu_message_id"] = sent.message_id
-
-
-async def deliver_file_by_id(message, context, file_id: int):
-    row = await get_file(file_id)
-    if not row or not row["visible"]:
-        await message.reply_text("الملف غير متاح حالياً.")
-        return
-
+    if row["kind"] == "note":
+        caption = f"📙 {row['title']}\n👨‍🏫 {row['teacher'] or ''}\n🏷 للصف الرابع الاعدادي"
+    else:
+        caption = row["title"]
     try:
-        if row["kind"] == "note":
-            await context.bot.send_document(
-                chat_id=message.chat_id,
-                document=row["file_id"],
-                caption=note_caption(row),
-            )
-        else:
-            await context.bot.send_document(
-                chat_id=message.chat_id,
-                document=row["file_id"],
-                caption=row["title"],
-            )
-    except TelegramError as exc:
-        logger.exception("Failed to deliver file %s: %s", file_id, exc)
-        await message.reply_text(
-            "تعذر إرسال الملف حالياً. استخدم لوحة المالك لاستبدال الملف بـ File ID جديد."
-        )
+        # File IDs are stored as supplied. send_document works for document IDs.
+        await ctx.bot.send_document(chat_id, row["file_id"], caption=caption, reply_markup=share_markup(row["id"]))
+    except TelegramError as e:
+        log.error("send failed for file %s: %s", row["id"], e)
+        await ctx.bot.send_message(chat_id, "تعذر إرسال الملف. أبلغ المالك.")
 
 
-async def main_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.effective_message
-    if not user or not message or not message.text:
-        return
-    if is_owner(user.id):
-        return
-    if not await ensure_access(update, context):
-        await send_subscription_message(update, context)
+async def send_question(msg, ctx, sec, month, owner):
+    r = q1("SELECT * FROM files WHERE kind='question' AND section=? AND month IS ? AND visible=1", (sec, month))
+    if r:
+        await send_item(ctx, msg.chat_id, r["id"], owner)
+    else:
+        await msg.reply_text("سيتم إضافة الأسئلة لاحقاً.")
+
+
+async def student_text(msg, ctx, text, owner):
+    screen = ctx.user_data.get("screen", ("home",))
+    chat_id = msg.chat_id
+
+    if text == BACK_TXT:
+        await show(msg, ctx, parent(screen), owner)
         return
 
-    text = message.text.strip()
-
-    # Subscription verification is also handled from the ReplyKeyboard.
-    if text == "تحقق من الاشتراك":
-        if await is_subscribed(context.bot, user.id):
-            await show_main_menu(message, context)
-        else:
-            await send_subscription_message(update, context)
+    choices = ctx.user_data.get("choices", {})
+    if text in choices:
+        await send_item(ctx, chat_id, choices[text], owner)
         return
 
-    nav = context.user_data.get("user_nav") or {}
-    level = nav.get("level")
+    k = screen[0]
+    if k == "home":
+        if text == "❓ الاسئلة":
+            await show(msg, ctx, ("questions",), owner)
+            return
+        if owner and text == "🛠 لوحة المالك":
+            await show_admin(msg, ctx)
+            return
+        s = subject_by_label(text, visible_only=True)
+        if s:
+            await show(msg, ctx, ("subject", s["id"]), owner)
+        return
 
-    if level == "subject":
-        subject_id = nav.get("subject_id")
+    if k == "subject":
+        sid = screen[1]
         if text == "📘 الكتب":
-            await show_file_reply_menu(message, context, subject_id, "book")
+            await show(msg, ctx, ("list", sid, "book"), owner)
+        elif text == "📙 الملازم":
+            await show(msg, ctx, ("list", sid, "note"), owner)
+        elif text == "🧾 الملخصات":
+            await show(msg, ctx, ("summaries", sid), owner)
+        return
+
+    if k == "summaries":
+        sid = screen[1]
+        s = q1("SELECT * FROM subjects WHERE id=?", (sid,))
+        if not s:
+            await show(msg, ctx, ("home",), owner)
             return
-        if text == "📙 الملازم":
-            await show_file_reply_menu(message, context, subject_id, "note")
-            return
-        if text == "رجوع":
-            await show_main_menu(message, context)
-            return
-
-    if level == "files":
-        subject_id = nav.get("subject_id")
-        kind = nav.get("kind")
-        if text == "رجوع":
-            await show_subject_reply_menu(message, context, subject_id)
-            return
-        file_buttons = nav.get("file_buttons", {})
-        file_id = file_buttons.get(text)
-        if file_id:
-            await deliver_file_by_id(message, context, int(file_id))
-            return
-
-    # Main subject menu.
-    subjects = await get_visible_subjects()
-    seen = set()
-    for subject in subjects:
-        name = subject["name"].strip()
-        normalized = " ".join(name.split()).casefold()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        labels = {name, f"{subject['emoji']} {name}".strip()}
-        if text in labels:
-            await show_subject_reply_menu(message, context, subject["id"])
-            return
-
-
-# ============================================================
-# ADMIN UI
-# ============================================================
-
-
-def admin_menu_markup() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("إضافة ملف", callback_data="adm:add")],
-        [InlineKeyboardButton("إضافة ملف بواسطة ID", callback_data="adm:addbyid")],
-        [InlineKeyboardButton("حذف ملف", callback_data="adm:delete"),
-         InlineKeyboardButton("تعديل ملف", callback_data="adm:edit")],
-        [InlineKeyboardButton("استبدال ملف", callback_data="adm:replace"),
-         InlineKeyboardButton("إخفاء/إظهار ملف", callback_data="adm:hide")],
-        [InlineKeyboardButton("إضافة مادة", callback_data="adm:addsubject")],
-        [InlineKeyboardButton("تعديل مادة", callback_data="adm:editsubject"),
-         InlineKeyboardButton("حذف مادة", callback_data="adm:deletesubject")],
-        [InlineKeyboardButton("🔎 التعرف على ID", callback_data="adm:fileid")],
-        [InlineKeyboardButton("الإحصائيات", callback_data="adm:stats")],
-        [InlineKeyboardButton("إرسال إعلان", callback_data="adm:broadcast")],
-        [InlineKeyboardButton("إعدادات البوت", callback_data="adm:settings")],
-        [InlineKeyboardButton("إغلاق", callback_data="adm:close")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def admin_state_reset(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("admin", None)
-
-
-def set_admin_state(context, **data):
-    state = context.user_data.setdefault("admin", {})
-    state.update(data)
-
-
-def get_admin_state(context) -> dict:
-    return context.user_data.setdefault("admin", {})
-
-
-async def show_admin_menu(query=None, message=None):
-    text = "لوحة المالك"
-    markup = admin_menu_markup()
-    if query:
-        await query.edit_message_text(text, reply_markup=markup)
-    elif message:
-        await message.reply_text(text, reply_markup=markup)
-
-
-async def admin_subject_picker(callback_prefix: str, include_hidden: bool = False) -> InlineKeyboardMarkup:
-    where = "" if include_hidden else "WHERE visible=1"
-    subjects = await db_execute(
-        f"SELECT * FROM subjects {where} ORDER BY sort_order, id",
-        fetch="all",
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"{s['emoji']} {s['name']}", callback_data=f"{callback_prefix}:{s['id']}")]
-        for s in subjects
-    ]
-    keyboard.append([InlineKeyboardButton("رجوع", callback_data="admin_menu")])
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def admin_file_picker(kind: Optional[str] = None, action: str = "pickfile") -> InlineKeyboardMarkup:
-    params = ()
-    where = "WHERE 1=1"
-    if kind:
-        where += " AND f.kind=?"
-        params = (kind,)
-    rows = await db_execute(
-        f"""
-        SELECT f.id, f.title, f.teacher, f.kind, s.name AS subject_name
-        FROM files f JOIN subjects s ON s.id=f.subject_id
-        {where}
-        ORDER BY s.sort_order, s.id, f.kind, f.id
-        """,
-        params,
-        fetch="all",
-    )
-    keyboard = []
-    for r in rows:
-        state = "✓" if (await get_file(r["id"]))["visible"] else "×"
-        label = f"{state} {r['subject_name']} | {kind_label(r['kind'])} | {r['title']}"
-        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"{action}:{r['id']}")])
-    if not rows:
-        keyboard.append([InlineKeyboardButton("لا توجد ملفات", callback_data="noop")])
-    keyboard.append([InlineKeyboardButton("رجوع", callback_data="admin_menu")])
-    return InlineKeyboardMarkup(keyboard)
-
-# ============================================================
-# USER HANDLERS
-# ============================================================
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_state_reset(context)
-    await upsert_user(update.effective_user)
-    if not await is_subscribed(context.bot, update.effective_user.id):
-        await send_subscription_message(update, context)
-        return
-    await show_main_menu(update.effective_message, context)
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id):
-        return
-    admin_state_reset(context)
-    await update.effective_message.reply_text("تم إلغاء العملية.", reply_markup=admin_menu_markup())
-
-
-async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await upsert_user(update.effective_user)
-    if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("هذا القسم للمالك فقط.")
-        return
-    admin_state_reset(context)
-    await show_admin_menu(message=update.effective_message)
-
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
-
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
-    if query.data == "noop":
+        labels = CH_LABELS if s["stype"] == "ch" else UNIT_LABELS
+        key = next((kk for kk, v in labels.items() if v == text), None)
+        if key:
+            r = q1("SELECT * FROM files WHERE subject_id=? AND kind='summary' AND section=? AND visible=1", (sid, key))
+            if r:
+                await send_item(ctx, chat_id, r["id"], owner)
+            else:
+                await msg.reply_text("سيتم إضافة الملخصات لاحقاً.")
         return
 
-    # Subscription check is always required for non-owner users.
-    if not is_owner(user_id) and not await is_subscribed(context.bot, user_id):
-        await send_subscription_message(update, context)
+    if k == "questions":
+        key = next((kk for kk, v in Q_SECTIONS.items() if v == text), None)
+        if key == "half":
+            await send_question(msg, ctx, "half", None, owner)
+        elif key:
+            await show(msg, ctx, ("qchapter", key), owner)
         return
 
-    data = query.data
-
-    if data == "check_sub":
-        if await is_subscribed(context.bot, user_id):
-            await show_main_menu(query.message, context, edit=True)
-        else:
-            await send_subscription_message(update, context)
-        return
-
-    if data == "home":
-        await show_main_menu(query.message, context, edit=True)
-        return
-
-    if data.startswith("sub:"):
-        await show_subject_menu(query, int(data.split(":")[1]))
-        return
-
-    if data.startswith("books:"):
-        await show_books(query, int(data.split(":")[1]))
-        return
-
-    if data.startswith("notes:"):
-        await show_notes(query, int(data.split(":")[1]))
-        return
-
-    if data.startswith("file:"):
-        await deliver_file(update, context, int(data.split(":")[1]))
-        return
-
-    # -------------------- ADMIN --------------------
-    if not is_owner(user_id):
-        return
-
-    if data == "admin_menu":
-        admin_state_reset(context)
-        await show_admin_menu(query=query)
-        return
-
-    if data == "adm:close":
-        admin_state_reset(context)
-        await query.edit_message_text("تم إغلاق لوحة المالك.")
-        return
-
-    # File ID lookup: enter a state that accepts the next uploaded file.
-    if data == "adm:fileid":
-        set_admin_state(context, action="fileid_wait_file")
-        await query.edit_message_text(
-            "أرسل ملف PDF الآن كـ Document حتى أستخرج الـ File ID.\n\n"
-            "للإلغاء: /cancel"
-        )
-        return
-
-    if data == "adm:add":
-        set_admin_state(context, action="add_file_choose_kind")
-        keyboard = [
-            [InlineKeyboardButton("📘 كتاب", callback_data="addkind:book")],
-            [InlineKeyboardButton("📙 ملزمة", callback_data="addkind:note")],
-            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text("اختَر نوع الملف:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data == "adm:addbyid":
-        set_admin_state(context, action="add_file_id_choose_kind")
-        keyboard = [
-            [InlineKeyboardButton("📘 كتاب", callback_data="addidkind:book")],
-            [InlineKeyboardButton("📙 ملزمة", callback_data="addidkind:note")],
-            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text("اختَر نوع الملف الذي تريد إضافته باستخدام File ID:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data.startswith("addidkind:"):
-        kind = data.split(":", 1)[1]
-        set_admin_state(context, action="add_file_id_choose_subject", kind=kind)
-        markup = await admin_subject_picker("addidsub")
-        await query.edit_message_text("اختَر المادة:", reply_markup=markup)
-        return
-
-    if data.startswith("addidsub:"):
-        subject_id = int(data.split(":", 1)[1])
-        set_admin_state(context, action="add_file_wait_file_id", subject_id=subject_id)
-        await query.edit_message_text("أرسل الـ File ID كنص، ثم سأطلب اسم الملف.\n\nللإلغاء: /cancel")
-        return
-
-    if data.startswith("addkind:"):
-        kind = data.split(":", 1)[1]
-        set_admin_state(context, action="add_file_choose_subject", kind=kind)
-        markup = await admin_subject_picker("addsub")
-        await query.edit_message_text("اختَر المادة:", reply_markup=markup)
-        return
-
-    if data.startswith("addsub:"):
-        subject_id = int(data.split(":")[1])
-        set_admin_state(context, action="add_file_wait_document", subject_id=subject_id)
-        await query.edit_message_text("أرسل الملف الآن كـ Document.")
-        return
-
-    if data == "adm:delete":
-        set_admin_state(context, action="delete_file_choose")
-        await query.edit_message_text(
-            "اختَر الملف المراد حذفه:",
-            reply_markup=await admin_file_picker(action="delfile"),
-        )
-        return
-
-    if data.startswith("delfile:"):
-        fid = int(data.split(":")[1])
-        row = await get_file(fid)
-        if not row:
-            await query.answer("الملف غير موجود.", show_alert=True)
-            return
-        await db_execute("DELETE FROM files WHERE id=?", (fid,))
-        await query.edit_message_text("تم حذف الملف.", reply_markup=admin_menu_markup())
-        admin_state_reset(context)
-        return
-
-    if data == "adm:hide":
-        await query.edit_message_text(
-            "اختَر الملف:",
-            reply_markup=await admin_file_picker(action="togglefile"),
-        )
-        return
-
-    if data.startswith("togglefile:"):
-        fid = int(data.split(":")[1])
-        row = await get_file(fid)
-        if not row:
-            await query.answer("الملف غير موجود.", show_alert=True)
-            return
-        new_value = 0 if row["visible"] else 1
-        await db_execute("UPDATE files SET visible=?, updated_at=? WHERE id=?", (new_value, now_iso(), fid))
-        await query.edit_message_text(
-            "تم تحديث حالة الملف.",
-            reply_markup=admin_menu_markup(),
-        )
-        return
-
-    if data == "adm:replace":
-        await query.edit_message_text(
-            "اختَر الملف المراد استبداله:",
-            reply_markup=await admin_file_picker(action="replacefile"),
-        )
-        return
-
-    if data.startswith("replacefile:"):
-        fid = int(data.split(":")[1])
-        if not await get_file(fid):
-            await query.answer("الملف غير موجود.", show_alert=True)
-            return
-        set_admin_state(context, action="replace_file_wait_document", file_id=fid)
-        await query.edit_message_text("أرسل الملف الجديد الآن كـ Document.")
-        return
-
-    if data == "adm:edit":
-        await query.edit_message_text(
-            "اختَر الملف المراد تعديله:",
-            reply_markup=await admin_file_picker(action="editfile"),
-        )
-        return
-
-    if data.startswith("editfile:"):
-        fid = int(data.split(":")[1])
-        row = await get_file(fid)
-        if not row:
-            await query.answer("الملف غير موجود.", show_alert=True)
-            return
-        set_admin_state(context, action="edit_file_menu", file_id=fid)
-        keyboard = [
-            [InlineKeyboardButton("تعديل الاسم", callback_data="editfield:title")],
-            [InlineKeyboardButton("تعديل الأستاذ", callback_data="editfield:teacher")],
-            [InlineKeyboardButton("نقل إلى مادة", callback_data="editfield:subject")],
-            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text(
-            f"الملف: {row['title']}\nاختَر ما تريد تعديله:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if data.startswith("editfield:"):
-        state = get_admin_state(context)
-        fid = state.get("file_id")
-        if not fid:
-            await query.edit_message_text("انتهت العملية.", reply_markup=admin_menu_markup())
-            return
-        field = data.split(":", 1)[1]
-        if field == "title":
-            set_admin_state(context, action="edit_file_wait_text", file_id=fid, field="title")
-            await query.edit_message_text("أرسل الاسم الجديد للملف.")
-        elif field == "teacher":
-            set_admin_state(context, action="edit_file_wait_text", file_id=fid, field="teacher")
-            await query.edit_message_text("أرسل اسم الأستاذ الجديد.")
-        elif field == "subject":
-            set_admin_state(context, action="edit_file_choose_subject", file_id=fid)
-            await query.edit_message_text(
-                "اختَر المادة الجديدة:",
-                reply_markup=await admin_subject_picker("newfilesub", include_hidden=True),
-            )
-        return
-
-    if data.startswith("newfilesub:"):
-        state = get_admin_state(context)
-        fid = state.get("file_id")
-        sid = int(data.split(":")[1])
-        if not fid:
-            await query.edit_message_text("انتهت العملية.", reply_markup=admin_menu_markup())
-            return
-        await db_execute("UPDATE files SET subject_id=?, updated_at=? WHERE id=?", (sid, now_iso(), fid))
-        admin_state_reset(context)
-        await query.edit_message_text("تم نقل الملف إلى المادة الجديدة.", reply_markup=admin_menu_markup())
-        return
-
-    if data == "adm:addsubject":
-        set_admin_state(context, action="add_subject_wait_name")
-        await query.edit_message_text("أرسل اسم المادة الجديدة.")
-        return
-
-    if data == "adm:editsubject":
-        await query.edit_message_text(
-            "اختَر المادة:",
-            reply_markup=await admin_subject_picker("edsub", include_hidden=True),
-        )
-        return
-
-    if data.startswith("edsub:"):
-        sid = int(data.split(":")[1])
-        set_admin_state(context, action="edit_subject_menu", subject_id=sid)
-        keyboard = [
-            [InlineKeyboardButton("تعديل الاسم", callback_data="edsubfield:name")],
-            [InlineKeyboardButton("تعديل الإيموجي", callback_data="edsubfield:emoji")],
-            [InlineKeyboardButton("إظهار/إخفاء", callback_data="edsubfield:visible")],
-            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text("اختَر التعديل:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data.startswith("edsubfield:"):
-        state = get_admin_state(context)
-        sid = state.get("subject_id")
-        if not sid:
-            await query.edit_message_text("انتهت العملية.", reply_markup=admin_menu_markup())
-            return
-        field = data.split(":", 1)[1]
-        if field == "visible":
-            row = await get_subject(sid)
-            new_visible = 0 if row["visible"] else 1
-            await db_execute("UPDATE subjects SET visible=? WHERE id=?", (new_visible, sid))
-            admin_state_reset(context)
-            await query.edit_message_text("تم تحديث ظهور المادة.", reply_markup=admin_menu_markup())
-        elif field == "name":
-            set_admin_state(context, action="edit_subject_wait_text", subject_id=sid, field="name")
-            await query.edit_message_text("أرسل الاسم الجديد للمادة.")
-        elif field == "emoji":
-            set_admin_state(context, action="edit_subject_wait_text", subject_id=sid, field="emoji")
-            await query.edit_message_text("أرسل الإيموجي الجديد.")
-        return
-
-    if data == "adm:deletesubject":
-        await query.edit_message_text(
-            "اختَر المادة المراد حذفها. حذف المادة يحذف ملفاتها أيضاً:",
-            reply_markup=await admin_subject_picker("delsub", include_hidden=True),
-        )
-        return
-
-    if data.startswith("delsub:"):
-        sid = int(data.split(":")[1])
-        row = await get_subject(sid)
-        if not row:
-            await query.answer("المادة غير موجودة.", show_alert=True)
-            return
-        keyboard = [
-            [InlineKeyboardButton("تأكيد الحذف", callback_data=f"confirmsubdel:{sid}")],
-            [InlineKeyboardButton("إلغاء", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text(
-            f"هل تؤكد حذف مادة {row['name']} وكل ملفاتها؟",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if data.startswith("confirmsubdel:"):
-        sid = int(data.split(":")[1])
-        await db_execute("DELETE FROM subjects WHERE id=?", (sid,))
-        admin_state_reset(context)
-        await query.edit_message_text("تم حذف المادة وملفاتها.", reply_markup=admin_menu_markup())
-        return
-
-    if data == "adm:stats":
-        users = await db_execute("SELECT COUNT(*) FROM users", fetch="value")
-        active = await db_execute(
-            "SELECT COUNT(*) FROM users WHERE last_seen >= datetime('now', '-30 days')",
-            fetch="value",
-        )
-        subjects = await db_execute("SELECT COUNT(*) FROM subjects", fetch="value")
-        visible_subjects = await db_execute("SELECT COUNT(*) FROM subjects WHERE visible=1", fetch="value")
-        books = await db_execute("SELECT COUNT(*) FROM files WHERE kind='book'", fetch="value")
-        notes = await db_execute("SELECT COUNT(*) FROM files WHERE kind='note'", fetch="value")
-        visible_files = await db_execute("SELECT COUNT(*) FROM files WHERE visible=1", fetch="value")
-        text = (
-            "الإحصائيات\n\n"
-            f"المستخدمون: {users}\n"
-            f"المستخدمون النشطون خلال 30 يوم: {active}\n"
-            f"المواد: {subjects}\n"
-            f"المواد الظاهرة: {visible_subjects}\n"
-            f"الكتب: {books}\n"
-            f"الملازم: {notes}\n"
-            f"الملفات الظاهرة: {visible_files}"
-        )
-        await query.edit_message_text(text, reply_markup=admin_menu_markup())
-        return
-
-    if data == "adm:broadcast":
-        set_admin_state(context, action="broadcast_wait_text")
-        await query.edit_message_text("أرسل نص الإعلان الآن.\n\nللإلغاء: /cancel")
-        return
-
-    if data == "adm:settings":
-        enabled = await subscription_enabled()
-        channel = await get_setting("mandatory_channel", MANDATORY_CHANNEL)
-        keyboard = [
-            [InlineKeyboardButton(
-                f"الاشتراك الإجباري: {'مفعّل' if enabled else 'معطّل'}",
-                callback_data="set:subscription",
-            )],
-            [InlineKeyboardButton("تغيير قناة الاشتراك", callback_data="set:channel")],
-            [InlineKeyboardButton("تعديل رسالة الترحيب", callback_data="set:welcome")],
-            [InlineKeyboardButton("رجوع", callback_data="admin_menu")],
-        ]
-        await query.edit_message_text(
-            f"إعدادات البوت\n\nقناة الاشتراك الحالية: {channel}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if data == "set:subscription":
-        enabled = await subscription_enabled()
-        await set_setting("subscription_enabled", "0" if enabled else "1")
-        await query.edit_message_text(
-            f"الاشتراك الإجباري الآن: {'مفعّل' if not enabled else 'معطّل'}",
-            reply_markup=admin_menu_markup(),
-        )
-        return
-
-    if data == "set:channel":
-        set_admin_state(context, action="settings_wait_channel")
-        await query.edit_message_text("أرسل معرف القناة مثل: @Kii_8i\n\nللإلغاء: /cancel")
-        return
-
-    if data == "set:welcome":
-        set_admin_state(context, action="settings_wait_welcome")
-        current = await get_setting("welcome", DEFAULT_WELCOME)
-        await query.edit_message_text(
-            f"الرسالة الحالية:\n\n{current}\n\nأرسل الرسالة الجديدة الآن."
-        )
-        return
-
-# ============================================================
-# ADMIN MESSAGE STATE HANDLER
-# ============================================================
-
-
-async def admin_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not is_owner(user.id):
-        return
-
-    state = get_admin_state(context)
-    action = state.get("action")
-    if not action:
-        return
-
-    message = update.effective_message
-
-    # FILE ID LOOKUP
-    if action == "fileid_wait_file":
-        file_id = None
-        file_type = None
-
-        if message.document:
-            file_id = message.document.file_id
-            file_type = "Document"
-        elif message.photo:
-            file_id = message.photo[-1].file_id
-            file_type = "Photo"
-        elif message.video:
-            file_id = message.video.file_id
-            file_type = "Video"
-        elif message.audio:
-            file_id = message.audio.file_id
-            file_type = "Audio"
-        elif message.voice:
-            file_id = message.voice.file_id
-            file_type = "Voice"
-        elif message.animation:
-            file_id = message.animation.file_id
-            file_type = "Animation"
-        elif message.sticker:
-            file_id = message.sticker.file_id
-            file_type = "Sticker"
-
-        if not file_id:
-            await message.reply_text(
-                "أرسل ملفاً أو صورة أو فيديو أو صوتاً حتى أستخرج الـ File ID.\n\nللإلغاء: /cancel"
-            )
-            return
-
-        await message.reply_text(
-            f"تم التعرف على الملف.\n\n"
-            f"النوع: {file_type}\n"
-            f"🆔 File ID:\n{file_id}\n\n"
-            "هذا الـ ID صادر من البوت الحالي ويمكن استخدامه مع هذا البوت."
-        )
-        admin_state_reset(context)
-        await message.reply_text("تم إنهاء عملية التعرف على ID.", reply_markup=admin_menu_markup())
-        return
-
-    # ADD FILE BY EXISTING TELEGRAM FILE ID
-    if action == "add_file_wait_file_id":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل الـ File ID كنص فقط.\n\nللإلغاء: /cancel")
-            return
-        file_id = message.text.strip()
-        if any(ch.isspace() for ch in file_id):
-            await message.reply_text("الـ File ID غير صحيح لأنه يحتوي على مسافات. أرسله كما ظهر لك تماماً.")
-            return
-        existing = await db_execute("SELECT id FROM files WHERE file_id=?", (file_id,), fetch="one")
-        if existing:
-            await message.reply_text("هذا الـ File ID موجود مسبقاً في قاعدة البيانات. أرسل ID مختلفاً أو ألغِ العملية بـ /cancel.")
-            return
-        state["file_id_new"] = file_id
-        state["file_type"] = "document"
-        state["action"] = "add_file_wait_title"
-        await message.reply_text("تم استلام الـ ID. هسه أرسل اسم الملزمة أو الكتاب.")
-        return
-
-    # ADD FILE: wait for document
-    if action == "add_file_wait_document":
-        if not message.document:
-            await message.reply_text("أرسل الملف كـ Document وليس كنص.\n\nللإلغاء: /cancel")
-            return
-        file_id = message.document.file_id
-        existing = await db_execute("SELECT id FROM files WHERE file_id=?", (file_id,), fetch="one")
-        if existing:
-            await message.reply_text("هذا الملف موجود مسبقاً في قاعدة البيانات.\n\nللإلغاء: /cancel")
-            return
-        state["file_id_new"] = file_id
-        state["original_filename"] = message.document.file_name or ""
-        state["file_type"] = "document"
-        if state.get("kind") == "note":
-            state["action"] = "add_file_wait_title"
-            await message.reply_text("أرسل اسم الملزمة.")
-        else:
-            state["action"] = "add_file_wait_title"
-            await message.reply_text("أرسل اسم الملف.")
-        return
-
-    if action == "add_file_wait_title":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل اسم الملف كنص.")
-            return
-        state["title"] = message.text.strip()
-        if state.get("kind") == "note":
-            state["action"] = "add_file_wait_teacher"
-            await message.reply_text("أرسل اسم الأستاذ.")
-        else:
-            await finish_add_file(update, context)
-        return
-
-    if action == "add_file_wait_teacher":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل اسم الأستاذ كنص.")
-            return
-        state["teacher"] = message.text.strip()
-        await finish_add_file(update, context)
-        return
-
-    # REPLACE FILE
-    if action == "replace_file_wait_document":
-        if not message.document:
-            await message.reply_text("أرسل الملف الجديد كـ Document.")
-            return
-        fid = state.get("file_id")
-        new_file_id = message.document.file_id
-        duplicate = await db_execute(
-            "SELECT id FROM files WHERE file_id=? AND id<>?",
-            (new_file_id, fid),
-            fetch="one",
-        )
-        if duplicate:
-            await message.reply_text("هذا الملف مستخدم بالفعل في ملف آخر.")
-            return
-        await db_execute(
-            "UPDATE files SET file_id=?, file_type='document', updated_at=? WHERE id=?",
-            (new_file_id, now_iso(), fid),
-        )
-        admin_state_reset(context)
-        await message.reply_text("تم استبدال الملف بنجاح.", reply_markup=admin_menu_markup())
-        return
-
-    # EDIT TEXT FIELD
-    if action == "edit_file_wait_text":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل النص المطلوب.")
-            return
-        fid = state.get("file_id")
-        field = state.get("field")
-        if field == "title":
-            await db_execute("UPDATE files SET title=?, updated_at=? WHERE id=?", (message.text.strip(), now_iso(), fid))
-        elif field == "teacher":
-            await db_execute("UPDATE files SET teacher=?, updated_at=? WHERE id=?", (message.text.strip(), now_iso(), fid))
-        admin_state_reset(context)
-        await message.reply_text("تم تعديل الملف.", reply_markup=admin_menu_markup())
-        return
-
-    # ADD SUBJECT
-    if action == "add_subject_wait_name":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل اسم المادة.")
-            return
-        state["subject_name"] = message.text.strip()
-        state["action"] = "add_subject_wait_emoji"
-        await message.reply_text("أرسل الإيموجي الخاص بالمادة.")
-        return
-
-    if action == "add_subject_wait_emoji":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل إيموجي واحد للمادة.")
-            return
-        name = state.get("subject_name")
-        emoji = message.text.strip()
-        exists = await db_execute("SELECT id FROM subjects WHERE name=?", (name,), fetch="one")
-        if exists:
-            await message.reply_text("هذه المادة موجودة مسبقاً.", reply_markup=admin_menu_markup())
-            admin_state_reset(context)
-            return
-        max_order = await db_execute("SELECT COALESCE(MAX(sort_order), 0) FROM subjects", fetch="value")
-        await db_execute(
-            "INSERT INTO subjects(name, emoji, sort_order, visible) VALUES(?, ?, ?, 1)",
-            (name, emoji, int(max_order) + 1),
-        )
-        admin_state_reset(context)
-        await message.reply_text("تمت إضافة المادة.", reply_markup=admin_menu_markup())
-        return
-
-    # EDIT SUBJECT TEXT
-    if action == "edit_subject_wait_text":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل النص المطلوب.")
-            return
-        sid = state.get("subject_id")
-        field = state.get("field")
-        value = message.text.strip()
-        if field == "name":
-            exists = await db_execute("SELECT id FROM subjects WHERE name=? AND id<>?", (value, sid), fetch="one")
-            if exists:
-                await message.reply_text("هذا الاسم مستخدم من مادة أخرى.")
-                return
-            await db_execute("UPDATE subjects SET name=? WHERE id=?", (value, sid))
-        elif field == "emoji":
-            await db_execute("UPDATE subjects SET emoji=? WHERE id=?", (value, sid))
-        admin_state_reset(context)
-        await message.reply_text("تم تعديل المادة.", reply_markup=admin_menu_markup())
-        return
-
-    # SETTINGS
-    if action == "settings_wait_channel":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل معرف القناة مثل @Kii_8i")
-            return
-        channel = message.text.strip()
-        if not channel.startswith("@"):
-            await message.reply_text("أرسل معرف القناة بصيغة @ChannelUsername")
-            return
-        await set_setting("mandatory_channel", channel)
-        admin_state_reset(context)
-        await message.reply_text("تم تحديث قناة الاشتراك.", reply_markup=admin_menu_markup())
-        return
-
-    if action == "settings_wait_welcome":
-        if not message.text:
-            await message.reply_text("أرسل رسالة الترحيب كنص.")
-            return
-        await set_setting("welcome", message.text)
-        admin_state_reset(context)
-        await message.reply_text("تم تحديث رسالة الترحيب.", reply_markup=admin_menu_markup())
-        return
-
-    # BROADCAST
-    if action == "broadcast_wait_text":
-        if not message.text or not message.text.strip():
-            await message.reply_text("أرسل نص الإعلان.")
-            return
-        await perform_broadcast(update, context, message.text.strip())
-        admin_state_reset(context)
+    if k == "qchapter":
+        mkey = next((kk for kk, v in Q_MONTHS.items() if v == text), None)
+        if mkey:
+            await send_question(msg, ctx, screen[1], mkey, owner)
         return
 
 
-async def finish_add_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = get_admin_state(context)
-    try:
-        subject_id = int(state["subject_id"])
-        kind = state["kind"]
-        title = state["title"]
-        teacher = state.get("teacher") if kind == "note" else None
-        file_id = state["file_id_new"]
-        exists = await db_execute("SELECT id FROM files WHERE file_id=?", (file_id,), fetch="one")
-        if exists:
-            await update.effective_message.reply_text("هذا الملف موجود مسبقاً.", reply_markup=admin_menu_markup())
-            admin_state_reset(context)
-            return
-        await db_execute(
-            """
-            INSERT INTO files(subject_id, kind, title, teacher, file_id, file_type, visible, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, 'document', 1, ?, ?)
-            """,
-            (subject_id, kind, title, teacher, file_id, now_iso(), now_iso()),
-        )
-        admin_state_reset(context)
-        await update.effective_message.reply_text("تمت إضافة الملف بنجاح.", reply_markup=admin_menu_markup())
-    except (KeyError, ValueError, sqlite3.Error) as exc:
-        logger.exception("finish_add_file failed: %s", exc)
-        await update.effective_message.reply_text("تعذر إضافة الملف بسبب خطأ داخلي. لم يتم تسجيل إضافة ناقصة.", reply_markup=admin_menu_markup())
-        admin_state_reset(context)
+async def start_flow(msg, ctx, typ):
+    ctx.user_data["flow"] = {"type": typ, "step": FIRST_STEP[typ]}
+    await prompt(msg, ctx)
 
 
-async def perform_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    rows = await db_execute("SELECT user_id FROM users WHERE blocked=0", fetch="all")
-    sent = 0
-    failed = 0
-    blocked = 0
-    for row in rows:
-        uid = row["user_id"]
+async def prompt(msg, ctx):
+    f = ctx.user_data["flow"]
+    step, typ = f["step"], f["type"]
+    rows, text = [], ""
+    if step == "subject":
+        text, rows = "اختر المادة:", subj_rows()
+    elif step == "kind":
+        text, rows = "اختر النوع:", [[kbtn("📘 كتاب"), kbtn("📙 ملزمة")]]
+    elif step == "doc":
+        text = "أرسل الملف الآن كـ Document."
+    elif step == "fid":
+        text = "أرسل الـ File ID كنص."
+    elif step == "title":
+        text = "أرسل اسم الملف."
+    elif step == "teacher":
+        text = "أرسل اسم الأستاذ."
+    elif step == "qsection":
+        text, rows = "اختر القسم:", [[kbtn("الفصل الأول"), kbtn("نصف السنة"), kbtn("الفصل الثاني")]]
+    elif step == "qmonth":
+        text, rows = "اختر الشهر:", [[kbtn("الشهر الأول"), kbtn("الشهر الثاني")]]
+    elif step == "ssection":
+        s = q1("SELECT * FROM subjects WHERE id=?", (f["sid"],))
+        labels = CH_LABELS if s and s["stype"] == "ch" else UNIT_LABELS
+        text, rows = "اختر الفصل أو الوحدة:", [[kbtn(v) for v in labels.values()]]
+    elif step == "sname":
+        text = "أرسل اسم المادة الجديدة."
+    elif step == "semoji":
+        text = "أرسل إيموجي المادة."
+    elif step == "field":
+        text = "اختر ما تريد تعديله:"
+        rows = [[kbtn(t) for t in FIELD_COL[typ]]]
+    elif step == "value":
+        text = "أرسل القيمة الجديدة."
+    elif step == "confirm":
+        text, rows = "هل تؤكد حذف المادة وكل ملفاتها؟", [[kbtn("✅ تأكيد الحذف", "danger")]]
+    elif step == "file":
+        text, rows = "اختر الملف، أو أرسل رقمه مثل #12:", owner_file_rows()
+    elif step == "wait":
+        text = "أرسل أي ملف الآن لأستخرج الـ ID. (للخروج اضغط إلغاء)"
+    elif step == "text":
+        text = "أرسل النص الآن."
+    await msg.reply_text(text, reply_markup=rkb(rows + [[CANCEL]]))
+
+
+def media_file_id(msg):
+    if msg.document:
+        return msg.document.file_id
+    if msg.photo:
+        return msg.photo[-1].file_id
+    if msg.video:
+        return msg.video.file_id
+    if msg.audio:
+        return msg.audio.file_id
+    if msg.voice:
+        return msg.voice.file_id
+    if msg.animation:
+        return msg.animation.file_id
+    if msg.sticker:
+        return msg.sticker.file_id
+    return None
+
+
+async def retry(msg, ctx, hint):
+    await msg.reply_text(hint)
+    await prompt(msg, ctx)
+
+
+async def do_broadcast(ctx, text):
+    ok = fail = 0
+    for u in q("SELECT user_id FROM users WHERE blocked=0"):
         try:
-            await context.bot.send_message(chat_id=uid, text=text)
-            sent += 1
+            await ctx.bot.send_message(u["user_id"], text)
+            ok += 1
         except Forbidden:
-            blocked += 1
-            failed += 1
-            await db_execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
+            fail += 1
+            x("UPDATE users SET blocked=1 WHERE user_id=?", (u["user_id"],))
         except TelegramError:
-            failed += 1
+            fail += 1
         await asyncio.sleep(0.05)
+    return ok, fail
 
-    await update.effective_message.reply_text(
-        f"انتهى الإعلان.\n\nتم الإرسال: {sent}\nفشل الإرسال: {failed}\nالمستخدمون المحظورون المكتشفون: {blocked}",
-        reply_markup=admin_menu_markup(),
+
+async def handle_flow(msg, ctx):
+    f = ctx.user_data.get("flow")
+    if not f:
+        return False
+    text = (msg.text or "").strip()
+    typ, step = f["type"], f["step"]
+    mid = media_file_id(msg)
+
+    if step == "subject":
+        s = subject_by_label(text)
+        if not s:
+            await retry(msg, ctx, "اختر المادة من الأزرار.")
+            return True
+        f["sid"] = s["id"]
+        f["step"] = {"addfile": "kind", "addid": "kind", "addsummary": "ssection",
+                     "editsubject": "field", "deletesubject": "confirm"}[typ]
+        await prompt(msg, ctx)
+        return True
+
+    if step == "kind":
+        k = {"📘 كتاب": "book", "📙 ملزمة": "note"}.get(text)
+        if not k:
+            await retry(msg, ctx, "اختر النوع من الأزرار.")
+            return True
+        f["kind"] = k
+        f["step"] = "doc" if typ == "addfile" else "fid"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "doc":
+        if not msg.document:
+            await retry(msg, ctx, "أرسل الملف كـ Document.")
+            return True
+        if typ == "replacefile":
+            try:
+                x("UPDATE files SET file_id=? WHERE id=?", (msg.document.file_id, f["file"]))
+            except sqlite3.IntegrityError:
+                await finish(msg, ctx, "هذا الملف مستخدم في ملف آخر.")
+                return True
+            await finish(msg, ctx, "✅ تم استبدال الملف.")
+            return True
+        f["fid"] = msg.document.file_id
+        f["step"] = "title"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "fid":
+        if not text or any(ch.isspace() for ch in text):
+            await retry(msg, ctx, "أرسل File ID صحيحاً كنص بدون مسافات.")
+            return True
+        if typ == "genlink":
+            row = q1("SELECT id FROM files WHERE file_id=?", (text,))
+            if not row:
+                await finish(msg, ctx, "لم أجد ملفاً بهذا الـ ID في البوت.")
+                return True
+            link = f"https://t.me/{ctx.bot.username}?start=f{row['id']}"
+            await finish(msg, ctx, f"🔗 رابط الملف:\n{link}")
+            return True
+        if typ == "addid":
+            f["fid"] = text
+            f["step"] = "title"
+            await prompt(msg, ctx)
+            return True
+        if typ == "addsummary":
+            s = q1("SELECT name FROM subjects WHERE id=?", (f["sid"],))
+            title = f"ملخص {s['name']} - {SECTION_NAMES[f['section']]}"
+            ok, err = insert_file(f["sid"], "summary", f["section"], None, title, None, text)
+            await finish(msg, ctx, "✅ تمت إضافة الملخص." if ok else err)
+            return True
+        if typ == "addquestion":
+            title = f"أسئلة {Q_SECTIONS[f['section']]}" + (f" - {Q_MONTHS[f['month']]}" if f.get("month") else "")
+            ok, err = insert_file(None, "question", f["section"], f.get("month"), title, None, text)
+            await finish(msg, ctx, "✅ تمت إضافة الأسئلة." if ok else err)
+            return True
+
+    if step == "title":
+        if not text:
+            await retry(msg, ctx, "أرسل الاسم كنص.")
+            return True
+        f["title"] = text
+        if f.get("kind") == "note":
+            f["step"] = "teacher"
+            await prompt(msg, ctx)
+            return True
+        ok, err = insert_file(f["sid"], f["kind"], None, None, f["title"], None, f["fid"])
+        await finish(msg, ctx, "✅ تمت إضافة الملف." if ok else err)
+        return True
+
+    if step == "teacher":
+        if not text:
+            await retry(msg, ctx, "أرسل اسم الأستاذ كنص.")
+            return True
+        ok, err = insert_file(f["sid"], f["kind"], None, None, f["title"], text, f["fid"])
+        await finish(msg, ctx, "✅ تمت إضافة الملزمة." if ok else err)
+        return True
+
+    if step == "qsection":
+        key = next((kk for kk, v in Q_SECTIONS.items() if v == text), None)
+        if not key:
+            await retry(msg, ctx, "اختر القسم من الأزرار.")
+            return True
+        f["section"] = key
+        if key == "half":
+            f["month"] = None
+            f["step"] = "fid"
+        else:
+            f["step"] = "qmonth"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "qmonth":
+        key = next((kk for kk, v in Q_MONTHS.items() if v == text), None)
+        if not key:
+            await retry(msg, ctx, "اختر الشهر من الأزرار.")
+            return True
+        f["month"] = key
+        f["step"] = "fid"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "ssection":
+        s = q1("SELECT * FROM subjects WHERE id=?", (f["sid"],))
+        labels = CH_LABELS if s and s["stype"] == "ch" else UNIT_LABELS
+        key = next((kk for kk, v in labels.items() if v == text), None)
+        if not key:
+            await retry(msg, ctx, "اختر الفصل أو الوحدة من الأزرار.")
+            return True
+        f["section"] = key
+        f["step"] = "fid"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "sname":
+        if not text:
+            await retry(msg, ctx, "أرسل اسم المادة كنص.")
+            return True
+        f["sname"] = text
+        f["step"] = "semoji"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "semoji":
+        if not text:
+            await retry(msg, ctx, "أرسل إيموجي المادة.")
+            return True
+        pos = q1("SELECT COALESCE(MAX(pos), 0) m FROM subjects")["m"] + 1
+        try:
+            x("INSERT INTO subjects(name, emoji, color, stype, pos) VALUES(?,?,?,?,?)",
+              (f["sname"], text, "success", "ch", pos))
+            await finish(msg, ctx, "✅ تمت إضافة المادة.")
+        except sqlite3.IntegrityError:
+            await finish(msg, ctx, "هذه المادة موجودة مسبقاً.")
+        return True
+
+    if step == "field":
+        col = FIELD_COL[typ].get(text)
+        if not col:
+            await retry(msg, ctx, "اختر من الأزرار.")
+            return True
+        f["col"] = col
+        f["step"] = "value"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "value":
+        if not text:
+            await retry(msg, ctx, "أرسل القيمة كنص.")
+            return True
+        if typ == "editsubject":
+            try:
+                x(f"UPDATE subjects SET {f['col']}=? WHERE id=?", (text, f["sid"]))
+            except sqlite3.IntegrityError:
+                await finish(msg, ctx, "هذا الاسم مستخدم من مادة أخرى.")
+                return True
+        else:
+            x(f"UPDATE files SET {f['col']}=? WHERE id=?", (text, f["file"]))
+        await finish(msg, ctx, "✅ تم التعديل.")
+        return True
+
+    if step == "confirm":
+        if text != "✅ تأكيد الحذف":
+            await retry(msg, ctx, "اضغط ✅ تأكيد الحذف أو إلغاء.")
+            return True
+        x("DELETE FROM subjects WHERE id=?", (f["sid"],))
+        await finish(msg, ctx, "تم حذف المادة وملفاتها.")
+        return True
+
+    if step == "file":
+        m = re.fullmatch(r"#?(\d+)", text)
+        row = q1("SELECT * FROM files WHERE id=?", (int(m.group(1)),)) if m else None
+        if not row:
+            await retry(msg, ctx, "اختر الملف من الأزرار أو أرسل رقمه مثل #12.")
+            return True
+        if typ == "deletefile":
+            x("DELETE FROM files WHERE id=?", (row["id"],))
+            await finish(msg, ctx, "تم حذف الملف.")
+            return True
+        if typ == "togglefile":
+            x("UPDATE files SET visible = 1 - visible WHERE id=?", (row["id"],))
+            state = "مخفي" if row["visible"] else "ظاهر"
+            await finish(msg, ctx, f"تم. الحالة الآن: {state}")
+            return True
+        f["file"] = row["id"]
+        f["step"] = "doc" if typ == "replacefile" else "field"
+        await prompt(msg, ctx)
+        return True
+
+    if step == "wait":
+        if not mid:
+            await retry(msg, ctx, "أرسل ملفاً أو صورة أو فيديو.")
+            return True
+        await msg.reply_text(f"🆔 الـ ID:\n{mid}\n\nأرسل ملفاً آخر، أو اضغط إلغاء.")
+        return True
+
+    if step == "text":
+        if not text:
+            await retry(msg, ctx, "أرسل النص كنص.")
+            return True
+        if typ == "channel":
+            channel = text.strip()
+            if not (channel.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,}", channel)):
+                await retry(msg, ctx, "الصيغة الصحيحة: @Channel")
+                return True
+            x("UPDATE settings SET value=? WHERE key='channel'", (channel,))
+            SUB_CACHE.clear()
+            await finish(msg, ctx, "✅ تم تغيير القناة.")
+            return True
+        ok, fail = await do_broadcast(ctx, text)
+        await finish(msg, ctx, f"تم الإرسال.\nنجح: {ok}\nفشل: {fail}")
+        return True
+
+    return False
+
+
+async def send_all_ids(msg):
+    rows = q("SELECT f.*, s.name AS sn FROM files f LEFT JOIN subjects s ON s.id=f.subject_id ORDER BY f.id")
+    if not rows:
+        await msg.reply_text("لا توجد ملفات.")
+        return
+    lines = []
+    for r in rows:
+        where = r["sn"] or "الأسئلة"
+        if r["section"]:
+            where += f" | {SECTION_NAMES.get(r['section'], Q_SECTIONS.get(r['section'], r['section']))}"
+        if r["month"]:
+            where += f" | {Q_MONTHS.get(r['month'], r['month'])}"
+        lines.append(f"#{r['id']} | {r['kind']} | {where} | {r['title']}\n{r['file_id']}")
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 2 > 3500:
+            if cur.strip():
+                chunks.append(cur.strip())
+            cur = ""
+        cur += line + "\n\n"
+    if cur.strip():
+        chunks.append(cur.strip())
+    for c in chunks:
+        await msg.reply_text(c)
+
+
+async def send_stats(msg):
+    users = q1("SELECT COUNT(*) c FROM users")["c"]
+    blocked = q1("SELECT COUNT(*) c FROM users WHERE blocked=1")["c"]
+    subs = q1("SELECT COUNT(*) c FROM subjects WHERE visible=1")["c"]
+    counts = {k: q1("SELECT COUNT(*) c FROM files WHERE kind=?", (k,))["c"]
+              for k in ("book", "note", "summary", "question")}
+    hidden = q1("SELECT COUNT(*) c FROM files WHERE visible=0")["c"]
+    await msg.reply_text(
+        "📊 الإحصائيات\n\n"
+        f"المستخدمون: {users}\n"
+        f"المحظورون: {blocked}\n"
+        f"المواد الظاهرة: {subs}\n"
+        f"الكتب: {counts['book']}\n"
+        f"الملازم: {counts['note']}\n"
+        f"الملخصات: {counts['summary']}\n"
+        f"الأسئلة: {counts['question']}\n"
+        f"الملفات المخفية: {hidden}",
+        reply_markup=owner_markup(),
     )
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    uid = user.id
+    upsert_user(uid)
+    owner = uid == OWNER_ID
+    ctx.user_data.pop("flow", None)
+
+    pending = None
+    if ctx.args and re.fullmatch(r"f\d+", ctx.args[0]):
+        pending = int(ctx.args[0][1:])
+
+    if not owner and not await is_sub(ctx.bot, uid):
+        await msg.reply_text(GATE_TEXT, reply_markup=gate_markup(pending))
+        return
+
+    if pending:
+        await send_item(ctx, msg.chat_id, pending, owner)
+    await show(msg, ctx, ("home",), owner)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled exception", exc_info=context.error)
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id == OWNER_ID:
+        await show_admin(update.effective_message, ctx)
 
+
+async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id == OWNER_ID:
+        await finish(update.effective_message, ctx, "تم الإلغاء.")
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cb = update.callback_query
+    if not cb:
+        return
+    if not cb.data or not cb.data.startswith("chk:"):
+        await cb.answer()
+        return
+    uid = cb.from_user.id
     try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("صار خطأ غير متوقع. حاول مرة ثانية.")
-    except Exception:
-        pass
+        pending = int(cb.data[4:]) or None
+    except ValueError:
+        pending = None
+    SUB_CACHE.pop(uid, None)
+    if not await is_sub(ctx.bot, uid):
+        await cb.answer("لم تشترك بعد، أو تعذّر التحقق من الاشتراك.", show_alert=True)
+        return
+    await cb.answer("تم التحقق ✅")
+    owner = uid == OWNER_ID
+    if pending:
+        await send_item(ctx, cb.message.chat_id, pending, owner)
+    ctx.user_data["screen"] = ("home",)
+    await ctx.bot.send_message(cb.message.chat_id, HOME_TEXT, reply_markup=home_markup(owner))
 
-# ============================================================
-# STARTUP
-# ============================================================
+
+async def on_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.inline_query.query.strip()
+    results = []
+    if query.isdigit():
+        row = q1("SELECT * FROM files WHERE id=? AND visible=1", (int(query),))
+        if row:
+            results.append(InlineQueryResultCachedDocument(
+                id=str(row["id"]), title=row["title"], document_file_id=row["file_id"]))
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    uid = user.id
+    upsert_user(uid)
+    owner = uid == OWNER_ID
+    text = (msg.text or "").strip()
+
+    if not owner and not await is_sub(ctx.bot, uid):
+        await msg.reply_text(GATE_TEXT, reply_markup=gate_markup())
+        return
+
+    if owner:
+        if text == CANCEL_TXT:
+            await finish(msg, ctx, "تم الإلغاء.")
+            return
+        if text in ADMIN_ACTIONS:
+            await start_flow(msg, ctx, ADMIN_ACTIONS[text])
+            return
+        if text == "🛠 لوحة المالك":
+            await show_admin(msg, ctx)
+            return
+        if text == "🏠 القائمة الرئيسية":
+            ctx.user_data.pop("flow", None)
+            await show(msg, ctx, ("home",), True)
+            return
+        if text == "🆔 جميع الـ IDs":
+            await send_all_ids(msg)
+            return
+        if text == "📊 الإحصائيات":
+            await send_stats(msg)
+            return
+        if text == "⚙️ تشغيل/إيقاف الاشتراك":
+            x("UPDATE settings SET value = CASE WHEN value='1' THEN '0' ELSE '1' END WHERE key='sub_on'")
+            SUB_CACHE.clear()
+            status = "مفعّل" if setting("sub_on") == "1" else "معطّل"
+            await msg.reply_text(f"الاشتراك الإجباري الآن: {status}", reply_markup=owner_markup())
+            return
+        if await handle_flow(msg, ctx):
+            return
+
+    await student_text(msg, ctx, text, owner)
+
+
+async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and user.id == OWNER_ID and ctx.user_data.get("flow"):
+        await handle_flow(update.effective_message, ctx)
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    log.exception("Unhandled bot error", exc_info=err)
 
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("ضع توكن البوت في BOT_TOKEN أو في متغير البيئة BOT_TOKEN قبل التشغيل.")
+    if not BOT_TOKEN:
+        raise RuntimeError("ضع توكن جديداً في متغير البيئة BOT_TOKEN قبل التشغيل.")
 
     init_db()
-    logger.info("Database initialized.")
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("admin", owner_panel))
-    application.add_handler(CallbackQueryHandler(callbacks))
-    async def non_command_router(update, context):
-        user = update.effective_user
-        if user and is_owner(user.id):
-            await admin_messages(update, context)
-            return
-        if update.effective_message and update.effective_message.text:
-            await main_menu_buttons(update, context)
-
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, non_command_router), group=0)
-    application.add_error_handler(error_handler)
-
-    logger.info("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(InlineQueryHandler(on_inline))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(
+        (filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO
+         | filters.VOICE | filters.ANIMATION | filters.Sticker.ALL) & ~filters.COMMAND,
+        on_media,
+    ))
+    app.add_error_handler(on_error)
+    log.info("Bot is running.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
