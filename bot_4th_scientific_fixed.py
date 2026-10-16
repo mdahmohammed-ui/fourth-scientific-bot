@@ -131,10 +131,21 @@ def init_db():
 
     # Migrate older databases in place; preserve existing subjects and files.
     # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
-    subject_columns = {row[1] for row in DB.execute("PRAGMA table_info(subjects)").fetchall()}
-    if "color" not in subject_columns:
-        DB.execute("ALTER TABLE subjects ADD COLUMN color TEXT NOT NULL DEFAULT 'success'")
-        DB.commit()
+    # Add newer subjects columns individually to support older database versions.
+    subject_columns = {
+        row[1] for row in DB.execute("PRAGMA table_info(subjects)").fetchall()
+    }
+    subject_migrations = {
+        "emoji": "TEXT NOT NULL DEFAULT '📚'",
+        "color": "TEXT NOT NULL DEFAULT 'success'",
+        "stype": "TEXT NOT NULL DEFAULT 'ch'",
+        "pos": "INTEGER NOT NULL DEFAULT 0",
+        "visible": "INTEGER NOT NULL DEFAULT 1",
+    }
+    for column, definition in subject_migrations.items():
+        if column not in subject_columns:
+            DB.execute(f"ALTER TABLE subjects ADD COLUMN {column} {definition}")
+    DB.commit()
 
     if not q1("SELECT 1 FROM settings WHERE key='seeded'"):
         for i, (name, emoji, color, stype) in enumerate(SUBJECTS, 1):
