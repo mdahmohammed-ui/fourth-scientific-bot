@@ -128,6 +128,14 @@ def init_db():
         file_id TEXT UNIQUE NOT NULL, visible INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
     """)
+
+    # Migrate older databases in place; preserve existing subjects and files.
+    # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+    subject_columns = {row[1] for row in DB.execute("PRAGMA table_info(subjects)").fetchall()}
+    if "color" not in subject_columns:
+        DB.execute("ALTER TABLE subjects ADD COLUMN color TEXT NOT NULL DEFAULT 'success'")
+        DB.commit()
+
     if not q1("SELECT 1 FROM settings WHERE key='seeded'"):
         for i, (name, emoji, color, stype) in enumerate(SUBJECTS, 1):
             x("INSERT OR IGNORE INTO subjects(name, emoji, color, stype, pos) VALUES(?,?,?,?,?)",
